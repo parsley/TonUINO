@@ -238,6 +238,7 @@
 // #define POLOLUSWITCH
 
 // include required libraries
+#include <Arduino.h>
 #include <avr/sleep.h>
 #include <SoftwareSerial.h>
 #include <SPI.h>
@@ -267,7 +268,7 @@ using namespace ace_button;
 // playback modes
 enum {NOMODE, STORY, ALBUM, PARTY, SINGLE, STORYBOOK, VSTORY, VALBUM, VPARTY};
 
-// button actions
+// button actions (Values for inputEvent variable. 'Pressed', 'Hold', 'Doublepressed')
 enum {NOP,
       B0P, B1P, B2P, B3P, B4P,
       B0H, B1H, B2H, B3H, B4H,
@@ -312,7 +313,7 @@ const uint8_t button4Pin = A4;                      // optional 5th button
 const uint16_t buttonClickDelay = 1000;             // time during which a button press is still a click (in milliseconds)
 const uint16_t buttonShortLongPressDelay = 2000;    // time after which a button press is considered a long press (in milliseconds)
 const uint16_t buttonLongLongPressDelay = 5000;     // longer long press delay for special cases, i.e. to trigger the parents menu (in milliseconds)
-const uint32_t debugConsoleSpeed = 9600;            // speed for the debug console
+const uint32_t debugConsoleSpeed = 115200;          // speed for the debug console
 
 // define magic cookie (by default 0x13 0x37 0xb3 0x47)
 const uint8_t magicCookieHex[4] = {0x13, 0x37, 0xb3, 0x47};
@@ -377,18 +378,20 @@ struct nfcTagStruct {
 
 // this struct stores playback state
 struct playbackStruct {
-  bool isLocked = false;
-  bool isPlaying = false;
-  bool isFresh = true;
-  bool isRepeat = false;
-  bool playListMode = false;
-  uint8_t mp3CurrentVolume = 0;
-  uint8_t folderStartTrack = 0;
-  uint8_t folderEndTrack = 0;
-  uint8_t playList[255] = {};
-  uint8_t playListItem = 0;
-  uint8_t playListItemCount = 0;
-  nfcTagStruct currentTag;
+  bool isLocked = false;          // buttons and NFC locked by IR remote
+  bool isPlaying = false;         // any mp3 is beeing played (either menu or regular track)
+  bool isFresh = true;            // **workaround for some DFPlayer mini modules that make two callbacks in a row when finishing a track**
+  bool isRepeat = false;          // single track repeat in some playback modes
+  bool playListMode = false;      // distinguish between regular track playback and playback of commands, info or during menu interaction
+  bool isSameTag = false;         //LP pause on tag removal support
+  uint8_t mp3CurrentVolume = 0;   //
+  uint8_t folderStartTrack = 0;   //
+  uint8_t folderEndTrack = 0;     //
+  uint8_t playList[255] = {};     //
+  uint8_t playListItem = 0;       //
+  uint8_t playListItemCount = 0;  //
+  nfcTagStruct currentTag;        //
+  nfcTagStruct previousTag;       //LP pause on tag removal support
 };
 
 // this struct stores preferences
@@ -436,6 +439,8 @@ bool enterPinCode();
 void statusLedUpdate(uint8_t statusLedAction, uint8_t red, uint8_t green, uint8_t blue, uint16_t statusLedUpdateInterval);
 void statusLedUpdateHal(uint8_t red, uint8_t green, uint8_t blue, int16_t brightness);
 #endif
+void compareNfcTag();
+void checkNfcTagPresence();
 
 // used by DFPlayer Mini library during callbacks
 class Mp3Notify {
@@ -733,9 +738,14 @@ void loop() {
     // ##############################
     // # nfc tag is successfully read
     if (readNfcTagStatus == 1) {
+      //LP compare previous and current tag
+      compareNfcTag();
+
       // #############################################################################
       // # nfc tag has our magic cookie on it, use data from nfc tag to start playback
-      if (playback.currentTag.cookie == magicCookie) {
+      if ((playback.currentTag.cookie == magicCookie)
+       && (playback.isSameTag == false))
+      {
         switchButtonConfiguration(PLAY);
         shutdownTimer(STOP);
 
@@ -817,6 +827,14 @@ void loop() {
         playback.playListMode = true;
         printModeFolderTrack(true);
         mp3.playFolderTrack(playback.currentTag.folder, playback.playList[playback.playListItem - 1]);
+      }
+
+      else if ((playback.currentTag.cookie == magicCookie)
+            && (playback.isSameTag == true))
+      {
+        //LP just trigger resume playback
+        Serial.println("gleiche Karte");
+        inputEvent = B0P;
       }
       // # end - nfc tag has our magic cookie on it
       // ##########################################
@@ -911,6 +929,14 @@ void loop() {
       }
       // # end - nfc tag does not have our magic cookie on it
       // ####################################################
+
+      // ###############################################################
+      // # nfc tag does not have our magic cookie on it and is not empty
+      else {
+        //LP What should we do? Announce unknown card? Offer to erase card?
+      }
+      // # end - nfc tag has an unkown magic cookie on it
+      // ################################################
     }
     // # end - nfc tag is successfully read
     // ####################################
@@ -1046,6 +1072,9 @@ void checkForInput() {
   button4.check();
 #endif
 
+  //LP during regular playback and only once per 100ms check if tag is still present. Else "inputEvent = B0P;"
+  checkNfcTagPresence();
+
 #if defined IRREMOTE
   uint8_t irRemoteEvent = NOP;
   uint16_t irRemoteCode = 0;
@@ -1172,7 +1201,7 @@ void translateButtonInput(AceButton *button, uint8_t eventType, uint8_t /* butto
   }
 }
 
-// switches button configuration dependig on the state that TonUINO is in
+// switches button configuration depending on the state that TonUINO is in
 void switchButtonConfiguration(uint8_t buttonMode) {
   switch (buttonMode) {
     case INIT: {
@@ -2209,3 +2238,61 @@ void statusLedUpdateHal(uint8_t red, uint8_t green, uint8_t blue, int16_t bright
 #endif
 }
 #endif
+
+//LP compare currentTag and previousTag. Also remember last valid NfcTag
+void compareNfcTag() {
+  // compare recently read NfcTag with last valid NfcTag
+  if ((playback.previousTag.cookie             == playback.currentTag.cookie)
+   && (playback.previousTag.version            == playback.currentTag.version)
+   && (playback.previousTag.folder             == playback.currentTag.folder)
+   && (playback.previousTag.mode               == playback.currentTag.mode)
+   && (playback.previousTag.multiPurposeData1  == playback.currentTag.multiPurposeData1)
+   && (playback.previousTag.multiPurposeData2  == playback.currentTag.multiPurposeData2))
+  {
+    // current tag is the same as previous tag.
+    playback.isSameTag = true;
+  }
+  else
+  {
+    playback.isSameTag = false;
+  }
+
+  // Always remember last valid NfcTag.
+  // If currentTag.cookie is not blank, update previousTag data.
+  if (playback.currentTag.cookie != 0) {
+    playback.previousTag.cookie             = playback.currentTag.cookie;
+    playback.previousTag.version            = playback.currentTag.version;
+    playback.previousTag.folder             = playback.currentTag.folder;
+    playback.previousTag.mode               = playback.currentTag.mode;
+    playback.previousTag.multiPurposeData1  = playback.currentTag.multiPurposeData1;
+    playback.previousTag.multiPurposeData2  = playback.currentTag.multiPurposeData2;
+  }
+}
+
+//LP check NfcTag presence.
+void checkNfcTagPresence() {
+  // during playback check tag presence. if tag is gone set inputEvent = B0P which triggers playback pause action
+  static unsigned long next_millis_ul = 0U;
+
+  // during playback and only once per 100ms check if tag is still present. Else "inputEvent = B0P;"
+  if ((playback.isPlaying == true)
+   && (playback.playListMode == true)
+   && (millis() > next_millis_ul))
+  {
+    // set interval for next test
+    next_millis_ul = millis() + 100U;
+    // test tag presence
+
+    uint8_t temp_buffer_au8[10];
+    uint8_t temp_buffer_size_u8 = 9;
+    MFRC522::StatusCode temp_statuscode = mfrc522.PICC_WakeupA(&temp_buffer_au8[0], &temp_buffer_size_u8);
+    if (temp_statuscode == 3)
+    {
+      // Pause playback
+      Serial.println("Karte fehlt");
+      inputEvent = B0P;
+    }
+    mfrc522.PICC_HaltA();
+    mfrc522.PCD_StopCrypto1();
+  }
+}
